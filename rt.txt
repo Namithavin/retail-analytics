@@ -1,0 +1,122 @@
+1;CREATE OR REPLACE TABLE `uae-retail-analytics.uae_retail_data.uae_clean_product_monthly` AS
+
+WITH validated_base AS (
+    SELECT
+        TRIM(SAFE_CAST(product_id AS STRING)) AS product_id,
+        TRIM(SAFE_CAST(product_name AS STRING)) AS product_name,
+        INITCAP(TRIM(SAFE_CAST(category AS STRING))) AS category,
+        INITCAP(TRIM(SAFE_CAST(Emirate AS STRING))) AS emirate,
+        TRIM(SAFE_CAST(country AS STRING)) AS country,
+        TRIM(SAFE_CAST(payment_method AS STRING)) AS payment_method,
+        
+        -- Price integrity
+        SAFE_CAST(price AS NUMERIC) AS price,
+        
+        -- Clamp ratings to valid range (1.0 to 5.0)
+        ROUND(
+            CASE 
+                WHEN SAFE_CAST(review_score AS FLOAT64) > 5.0 THEN 5.0
+                WHEN SAFE_CAST(review_score AS FLOAT64) < 1.0 AND SAFE_CAST(review_score AS FLOAT64) > 0 THEN 1.0
+                ELSE COALESCE(SAFE_CAST(review_score AS FLOAT64), 0)
+            END, 2
+        ) AS review_score,
+        
+        COALESCE(SAFE_CAST(review_count AS INT64), 0) AS review_count,
+
+        -- Standardize monthly sales quantities
+        COALESCE(SAFE_CAST(sales_month_1 AS INT64), 0) AS month_1,
+        COALESCE(SAFE_CAST(sales_month_2 AS INT64), 0) AS month_2,
+        COALESCE(SAFE_CAST(sales_month_3 AS INT64), 0) AS month_3,
+        COALESCE(SAFE_CAST(sales_month_4 AS INT64), 0) AS month_4,
+        COALESCE(SAFE_CAST(sales_month_5 AS INT64), 0) AS month_5,
+        COALESCE(SAFE_CAST(sales_month_6 AS INT64), 0) AS month_6,
+        COALESCE(SAFE_CAST(sales_month_7 AS INT64), 0) AS month_7,
+        COALESCE(SAFE_CAST(sales_month_8 AS INT64), 0) AS month_8,
+        COALESCE(SAFE_CAST(sales_month_9 AS INT64), 0) AS month_9,
+        COALESCE(SAFE_CAST(sales_month_10 AS INT64), 0) AS month_10,
+        COALESCE(SAFE_CAST(sales_month_11 AS INT64), 0) AS month_11,
+        COALESCE(SAFE_CAST(sales_month_12 AS INT64), 0) AS month_12,
+        
+        -- Deduplicate if necessary
+        ROW_NUMBER() OVER(
+            PARTITION BY SAFE_CAST(product_id AS STRING) 
+            ORDER BY SAFE_CAST(review_count AS INT64) DESC
+        ) AS row_num
+    FROM `uae-retail-analytics.uae_retail_data.uae_orders`
+    WHERE product_id IS NOT NULL 
+      AND SAFE_CAST(price AS NUMERIC) > 0
+)
+
+SELECT 
+    product_id,
+    product_name,
+    category,
+    emirate,
+    country,
+    payment_method,
+    price,
+    review_score,
+    review_count,
+    CAST(REPLACE(month_col, 'month_', '') AS INT64) AS month_num,
+    DATE(2025, CAST(REPLACE(month_col, 'month_', '') AS INT64), 1) AS sales_date,
+    units_sold,
+    ROUND(units_sold * price, 2) AS revenue_aed
+FROM validated_base
+UNPIVOT (
+    units_sold FOR month_col IN (
+        month_1, month_2, month_3, month_4,
+        month_5, month_6, month_7, month_8,
+        month_9, month_10, month_11, month_12
+ )
+)
+WHERE row_num = 1;
+
+--Payment prreference by Emirate
+SELECT 
+    emirate,
+    payment_method,
+    SUM(units_sold) AS total_units_sold,
+    ROUND(SUM(revenue_aed), 2) AS payment_revenue_aed,
+    ROUND(
+        SUM(revenue_aed) * 100.0 / SUM(SUM(revenue_aed)) OVER (PARTITION BY emirate), 
+    2) AS emirate_payment_share_pct
+FROM `uae-retail-analytics.uae_retail_data.uae_clean_product_monthly`
+GROUP BY emirate, payment_method
+ORDER BY emirate, payment_revenue_aed DESC;
+
+--Seasonality and Peak eventrun rates(MoM growth)
+SELECT 
+    month_num,
+    sales_date,
+    SUM(units_sold) AS total_units,
+    ROUND(SUM(revenue_aed), 2) AS monthly_revenue_aed,
+    ROUND(
+        (SUM(revenue_aed) - LAG(SUM(revenue_aed)) OVER (ORDER BY month_num))
+        / NULLIF(LAG(SUM(revenue_aed)) OVER (ORDER BY month_num), 0) * 100,
+    2) AS mom_growth_pct
+FROM `uae-retail-analytics.uae_retail_data.uae_clean_product_monthly`
+GROUP BY month_num, sales_date
+ORDER BY month_num;
+
+--Customer sentiment and price tier elasticity
+SELECT 
+    category,
+    CASE 
+        WHEN price < 100 THEN 'Budget (<100 AED)'
+        WHEN price BETWEEN 100 AND 300 THEN 'Mid-Tier (100-300 AED)'
+        ELSE 'Premium (>300 AED)'
+    END AS price_tier,
+    COUNT(DISTINCT product_id) AS total_skus,
+    ROUND(AVG(review_score), 2) AS avg_review_score,
+    SUM(review_count) AS total_reviews,
+    SUM(units_sold) AS total_units_sold,
+    ROUND(SUM(revenue_aed), 2) AS total_revenue_aed
+FROM `uae-retail-analytics.uae_retail_data.uae_clean_product_monthly`
+GROUP BY category, price_tier
+ORDER BY total_revenue_aed DESC;
+
+
+
+    )
+)
+WHERE row_num = 1;
